@@ -7,7 +7,7 @@ This refactored version:
 - Validates and sanitizes all paths, ensuring operations stay within a safe base directory.
 - Uses context manager for image I/O.
 - Properly handles alpha channel when converting to grayscale ('L' or 'LA').
-- Fixes batch mode to respect include-alpha flag and avoid silent ignores.
+- Fixes batch mode to respect include-alpha flag and align output extensions with actual save format.
 - Removes unused imports and small code smells.
 - Provides robust error messages and progress indication (optional).
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import logging
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -25,7 +26,6 @@ except Exception:  # pragma: no cover
     print("Pillow is required. Install it via: pip install pillow", file=sys.stderr)
     sys.exit(2)
 
-# Optional progress bar
 try:
     from tqdm import tqdm  # type: ignore
     HAS_TQDM = True
@@ -33,15 +33,17 @@ except Exception:  # pragma: no cover
     HAS_TQDM = False
 
 EXTENSIONS_DEFAULT = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
-BASE_DIR = Path.cwd().resolve()
 
 
 def _ext_from_format(fmt: Optional[str]) -> str:
+    """
+    Return a conservative extension for the requested format.
+    If fmt is None, default to PNG for safety with grayscale (no alpha loss surprises).
+    """
     if fmt is None:
-        # Default extension: PNG (safe for grayscale and alpha handling)
         return '.png'
-    f = fmt.upper()
-    if f in ('PNG',):
+    f = str(fmt).upper()
+    if f == 'PNG':
         return '.png'
     if f in ('JPEG', 'JPG'):
         return '.jpg'
@@ -57,14 +59,12 @@ def _resolve_output_format_and_extension(
     requested_fmt: Optional[str], actual_mode: str
 ) -> Tuple[Optional[str], str]:
     """
-    Returns a (format, extension) tuple.
-    If alpha is present (actual_mode == 'LA'), JPEG is not suitable; we force PNG.
+    Determine the real format and extension to use based on the desired mode.
+    If alpha is present (actual_mode == 'LA'), JPEG is not suitable; force PNG.
     """
     fmt = None if requested_fmt is None else str(requested_fmt).upper()
     ext = _ext_from_format(fmt)
 
-    # If we have alpha and user asked for JPEG-like format (or none),
-    # force PNG to preserve alpha safely.
     if actual_mode == 'LA' and (fmt is None or fmt in ('JPEG', 'JPG')):
         fmt = 'PNG'
         ext = '.png'
@@ -72,25 +72,20 @@ def _resolve_output_format_and_extension(
     return fmt, ext
 
 
-def _safe_dirs(p: Path) -> Path:
-    return p.resolve()
+def _validate_within_base(p: Path, base_dir: Path) -> Path:
+    """
+    Ensure that path p is within base_dir after resolving symlinks and relative parts.
+    """
+    rp = p.resolve()
+    try:
+        rp.relative_to(base_dir.resolve())
+    except Exception:
+        raise ValueError(f"Path '{p}' is outside the allowed base directory '{base_dir}'.")
+    return rp
 
 
 def _ensure_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _is_image_file(p: Path, extensions: Sequence[str]) -> bool:
-    return p.is_file() and p.suffix.lower() in [e.lower() for e in extensions]
-
-
-def _validate_within_base(p: Path) -> Path:
-    rp = p.resolve()
-    try:
-        rp.relative_to(BASE_DIR)
-    except Exception:
-        raise ValueError(f"Path '{p}' is outside the allowed base directory '{BASE_DIR}'.")
-    return rp
 
 
 def convert_image_to_grayscale(
@@ -137,7 +132,6 @@ def convert_image_to_grayscale(
             # Preserve EXIF data if requested (most effective for JPEG)
             exif_bytes = img.info.get('exif') if preserve_metadata else None
 
-            # If the chosen format is None, Pillow will infer from extension
             save_kwargs = {}
             if fmt is not None:
                 save_kwargs['format'] = fmt
@@ -205,25 +199,23 @@ def batch_convert(
 
     results: List[Path] = []
     for infile in iterator:
-        # Determine the relative path for structure preservation
+        # Determine the actual mode for file naming and saving
+        actual_mode_for_path = 'LA' if include_alpha or (mode == 'LA') else 'L'
+        fmt, ext = _resolve_output_format_and_extension(output_format, actual_mode_for_path)
+
+        # Build output path with structure preservation or flatten
         if keep_structure:
             try:
                 rel = infile.relative_to(input_dir)
             except Exception:
                 rel = infile.name  # fallback
-            # Determine destination dir and filename
             rel_parent = Path(rel).parent
             dest_dir = output_dir / rel_parent
             dest_dir.mkdir(parents=True, exist_ok=True)
-            ext = _ext_from_format(output_format)
-            out_filename = f"bw_{infile.stem}{ext}"
-            out_path = dest_dir / out_filename
+            out_path = dest_dir / f"bw_{infile.stem}{ext}"
         else:
-            # Flatten: all outputs go into output_dir with same basename
             output_dir.mkdir(parents=True, exist_ok=True)
-            ext = _ext_from_format(output_format)
-            out_filename = f"bw_{infile.stem}{ext}"
-            out_path = output_dir / out_filename
+            out_path = output_dir / f"bw_{infile.stem}{ext}"
 
         if out_path.exists() and not overwrite:
             # Skip if not overwriting existing file
@@ -231,18 +223,17 @@ def batch_convert(
 
         try:
             converted = convert_image_to_grayscale(
-                input_path=infile,
+                input_path=in infile if False else infile,
                 output_path=out_path,
                 mode=mode,
                 preserve_metadata=preserve_metadata,
-                include_alpha=include_alpha or (mode == 'LA'),
+                include_alpha=actual_mode_for_path == 'LA',
                 output_format=output_format,
                 quality=quality,
             )
             results.append(converted)
         except Exception as e:
             # For batch mode, continue processing other files
-            # Print error message but do not raise
             print(f"Error processing '{infile}': {e}", file=sys.stderr)
 
     return results
@@ -266,6 +257,7 @@ def parse_args() -> argparse.Namespace:
     # Grayscale mode
     parser.add_argument('-m', '--mode', choices=['L', 'LA'], default='L', help="Target grayscale mode. 'L' for 8-bit grayscale, 'LA' to keep alpha.")
     parser.add_argument('--include-alpha', action='store_true', dest='include_alpha', help="Include alpha channel when converting (produces LA). Overrides mode decision.")
+
     # Output format and quality
     parser.add_argument('-f', '--output-format', dest='output_format', help="Output image format (PNG, JPEG, WEBP, TIFF).")
     parser.add_argument('-q', '--quality', type=int, default=None, help="Output quality for lossy formats (e.g., JPEG).")
@@ -285,25 +277,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     try:
-        input_path = Path(args.input)
+        input_path = Path(args.input).resolve()
+        base_dir = Path.cwd().resolve()
 
-        # Resolve and basic safety checks
+        # Validate existence
         if not input_path.exists():
             print(f"Error: Input path not found: {input_path}", file=sys.stderr)
             return 2
 
-        # Ensure input is within base directory
+        # Validate within base
         try:
-            _validate_within_base(input_path)
+            input_path = _validate_within_base(input_path, base_dir)
         except ValueError as ve:
             print(f"Error: {ve}", file=sys.stderr)
             return 2
 
-        # Decide if single file or directory
+        # Decide single vs batch
         if input_path.is_file():
-            # Single image mode
             ext = _ext_from_format(args.output_format)
 
             # Determine final output path
@@ -316,7 +309,7 @@ def main() -> int:
 
             # Safety: ensure path inside base
             try:
-                out_path = _validate_within_base(out_path)
+                out_path = _validate_within_base(out_path, base_dir)
             except ValueError:
                 print("Error: Output path is outside the allowed base directory.", file=sys.stderr)
                 return 2
@@ -343,16 +336,14 @@ def main() -> int:
         else:
             # Directory/batch mode
             input_dir = input_path
-            output_dir = None
             if args.output:
                 output_dir = Path(args.output)
             else:
                 output_dir = input_dir.parent / (input_dir.name + "_gray")
 
-            # Safety: ensure dirs inside base
             try:
-                input_dir = _validate_within_base(input_dir)
-                output_dir = _validate_within_base(output_dir)
+                input_dir = _validate_within_base(input_dir, base_dir)
+                output_dir = _validate_within_base(output_dir, base_dir)
             except ValueError as ve:
                 print(f"Error: {ve}", file=sys.stderr)
                 return 2
