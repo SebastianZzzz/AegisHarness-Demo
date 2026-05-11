@@ -31,7 +31,8 @@ def is_within_base(path: Path, base_dir: Optional[Path]) -> bool:
     if base_dir is None:
         return True
     try:
-        return path.resolve().relative_to(base_dir.resolve()) is not None  # type: ignore
+        path.resolve().relative_to(base_dir.resolve())
+        return True
     except Exception:
         return False
 
@@ -46,13 +47,36 @@ def derive_output_path(input_path: Path, suffix: str = "_gray", override_ext: Op
     return input_path.parent / (input_path.stem + suffix + ext)
 
 
-def derive_output_name(input_path: Path, suffix: str = "_gray", override_ext: Optional[str] = None) -> str:
-    ext = override_ext if override_ext else input_path.suffix
-    if not ext:
-        ext = ".png"
-    if not ext.startswith("."):
-        ext = "." + ext
-    return input_path.stem + suffix + ext
+def derive_output_path_for_single(input_path: Path,
+                                output_arg: Optional[Path],
+                                suffix: str = "_gray",
+                                format_override: Optional[str] = None) -> Path:
+    """
+    Determine the final output path for a single-file operation.
+    - If output_arg is None: derive a file in the input's directory.
+    - If output_arg is an existing directory: place derived file inside it.
+    - If output_arg is a file (has suffix): use it as the exact output path.
+    - If output_arg is a non-existing path with no suffix: treat as directory and place derived file inside it.
+    """
+    derived = derive_output_path(input_path, suffix, format_override)
+
+    if output_arg is None:
+        return derived
+
+    # If output_arg exists
+    if output_arg.exists():
+        if output_arg.is_dir():
+            return output_arg / derived.name
+        else:
+            return output_arg
+
+    # If not existing yet
+    if output_arg.suffix:
+        # Treat as explicit file path
+        return output_arg
+    else:
+        # Treat as directory
+        return output_arg / derived.name
 
 
 def validate_input_path(path: Path) -> None:
@@ -138,13 +162,21 @@ def process_single(input_path: Path,
         return False, f"Error processing {input_path}: {e}"
 
 
-def discover_inputs(directory: Path, recursive: bool) -> List[Path]:
+def discover_inputs(directory: Path, recursive: bool, exclude_dir: Optional[Path] = None) -> List[Path]:
     if recursive:
         candidates = directory.rglob('*')
     else:
         candidates = directory.glob('*')
     imgs: List[Path] = []
     for p in candidates:
+        if exclude_dir is not None:
+            try:
+                excl = exclude_dir.resolve()
+                pr = p.resolve()
+                if pr == excl or excl in pr.parents:
+                    continue
+            except Exception:
+                pass
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
             imgs.append(p)
     return sorted(imgs)
@@ -158,7 +190,7 @@ def process_batch(batch_dir: Path,
                   base_dir: Optional[Path],
                   suffix: str = "_gray",
                   summary_json: bool = False) -> int:
-    inputs = discover_inputs(batch_dir, recursive)
+    inputs = discover_inputs(batch_dir, recursive, exclude_dir=output_dir)
     total = len(inputs)
     if total == 0:
         logging.info("No input images found in batch directory.")
@@ -168,14 +200,15 @@ def process_batch(batch_dir: Path,
     results: List[Dict[str, str]] = []
     success_count = 0
     for idx, in_path in enumerate(inputs, start=1):
-        out_path = derive_output_path(in_path, suffix=suffix, override_ext=(format_override))
-        # If output_dir is provided, place under it; if it's the same dir, it's still fine
-        if output_dir:
-            # If output_dir is a directory
-            if (output_dir.exists() and output_dir.is_dir()) or not output_dir.exists():
-                out_path = output_dir / out_path.name
+        out_path = derive_output_path_for_single(in_path, output_dir, suffix=suffix, format_override=format_override)
+
         # safety: ensure within base_dir if specified
-        ok, msg = process_single(in_path, out_path, preserve_exif, format_override, base_dir)
+        try:
+            ok, msg = process_single(in_path, out_path, preserve_exif, format_override, base_dir)
+        except Exception as e:
+            ok = False
+            msg = f"Error processing {in_path}: {e}"
+
         results.append({
             "input": str(in_path),
             "output": str(out_path),
@@ -205,27 +238,6 @@ def process_batch(batch_dir: Path,
 
     return 0 if total == success_count else 2
 
-
-def derive_output_path_for_single(input_path: Path,
-                                output_arg: Optional[Path],
-                                suffix: str,
-                                format_override: Optional[str]) -> Path:
-    if output_arg is None:
-        return derive_output_path(input_path, suffix, format_override)
-    # If output_arg seems like a directory (exists or ends with a separator or has no suffix)
-    if output_arg.exists():
-        if output_arg.is_dir():
-            return derive_output_path(input_path, suffix, format_override)
-        else:
-            return output_arg
-    else:
-        # Heuristic: if it has a suffix, treat as file; else as dir
-        if output_arg.suffix:
-            return output_arg
-        else:
-            # treat as dir
-            return derive_output_path(input_path, suffix, format_override).replace(str(input_path.parent) + '/', str(output_arg) + '/')
- 
 
 def main():
     parser = argparse.ArgumentParser(
@@ -302,6 +314,7 @@ def main():
             preserve_exif=args.preserve_exif,
             format_override=args.format,
             base_dir=base_dir,
+            suffix="_gray",
             summary_json=args.summary_json
         )
 
@@ -319,27 +332,8 @@ def main():
             return 1
 
         # Resolve output path
-        if args.output_path:
-            output_arg = Path(args.output_path)
-        else:
-            output_arg = None
-        if output_arg is not None:
-            # If output path is a directory, derive file inside
-            try:
-                if output_arg.exists() and output_arg.is_dir():
-                    output_path = derive_output_path(input_path, suffix="_gray", override_ext=args.format)
-                    output_path = output_arg / output_path.name
-                elif output_arg.suffix:
-                    output_path = output_arg
-                else:
-                    # Treat as directory
-                    output_path = derive_output_path(input_path, suffix="_gray", override_ext=args.format)
-                    output_path = output_arg / output_path.name
-            except Exception as e:
-                logging.error(f"Failed to interpret output path: {e}")
-                return 1
-        else:
-            output_path = derive_output_path(input_path, suffix="_gray", override_ext=args.format)
+        output_path = derive_output_path_for_single(input_path, Path(args.output_path) if args.output_path else None,
+                                                    suffix="_gray", format_override=args.format)
 
         # Ensure safety
         if base_dir is not None and not is_within_base(output_path, base_dir):
