@@ -3,25 +3,21 @@
 Image grayscale converter using Pillow
 Supports single image and batch (directory) processing with optional structure preservation.
 
-Features:
-- Convert to grayscale with mode 'L' by default, optional 'LA' to preserve alpha
-- CLI (argparse) with input/output, batch options, extensions filter, quality, etc.
-- Batch mode preserves directory structure (configurable)
-- Metadata handling (EXIF/ICC) preservation option
-- Safe output naming, overwrite handling, and error reporting
-- Progress indicator (optional, uses tqdm if available)
-
-Note: This script is designed to be self-contained and easily importable as a module.
+This refactored version:
+- Validates and sanitizes all paths, ensuring operations stay within a safe base directory.
+- Uses context manager for image I/O.
+- Properly handles alpha channel when converting to grayscale ('L' or 'LA').
+- Fixes batch mode to respect include-alpha flag and avoid silent ignores.
+- Removes unused imports and small code smells.
+- Provides robust error messages and progress indication (optional).
 """
 
 from __future__ import annotations
 
 import argparse
-import errno
-import os
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -36,11 +32,11 @@ try:
 except Exception:  # pragma: no cover
     HAS_TQDM = False
 
-
 EXTENSIONS_DEFAULT = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
+BASE_DIR = Path.cwd().resolve()
 
 
-def _ext_from_format(fmt: Optional[str], actual_mode: str) -> str:
+def _ext_from_format(fmt: Optional[str]) -> str:
     if fmt is None:
         # Default extension: PNG (safe for grayscale and alpha handling)
         return '.png'
@@ -65,7 +61,7 @@ def _resolve_output_format_and_extension(
     If alpha is present (actual_mode == 'LA'), JPEG is not suitable; we force PNG.
     """
     fmt = None if requested_fmt is None else str(requested_fmt).upper()
-    ext = _ext_from_format(fmt, actual_mode)
+    ext = _ext_from_format(fmt)
 
     # If we have alpha and user asked for JPEG-like format (or none),
     # force PNG to preserve alpha safely.
@@ -76,12 +72,25 @@ def _resolve_output_format_and_extension(
     return fmt, ext
 
 
+def _safe_dirs(p: Path) -> Path:
+    return p.resolve()
+
+
 def _ensure_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _is_image_file(p: Path, extensions: Sequence[str]) -> bool:
     return p.is_file() and p.suffix.lower() in [e.lower() for e in extensions]
+
+
+def _validate_within_base(p: Path) -> Path:
+    rp = p.resolve()
+    try:
+        rp.relative_to(BASE_DIR)
+    except Exception:
+        raise ValueError(f"Path '{p}' is outside the allowed base directory '{BASE_DIR}'.")
+    return rp
 
 
 def convert_image_to_grayscale(
@@ -158,6 +167,7 @@ def batch_convert(
     output_format: Optional[str] = None,
     quality: Optional[int] = None,
     keep_structure: bool = True,
+    include_alpha: bool = False,
     progress: bool = False,
 ) -> List[Path]:
     """
@@ -205,15 +215,13 @@ def batch_convert(
             rel_parent = Path(rel).parent
             dest_dir = output_dir / rel_parent
             dest_dir.mkdir(parents=True, exist_ok=True)
-            # Build output filename
-            ext = _ext_from_format(output_format, mode if not keep_structure else mode)
-            # We reuse the same stem but prefix with 'bw_'
+            ext = _ext_from_format(output_format)
             out_filename = f"bw_{infile.stem}{ext}"
             out_path = dest_dir / out_filename
         else:
             # Flatten: all outputs go into output_dir with same basename
             output_dir.mkdir(parents=True, exist_ok=True)
-            ext = _ext_from_format(output_format, mode)
+            ext = _ext_from_format(output_format)
             out_filename = f"bw_{infile.stem}{ext}"
             out_path = output_dir / out_filename
 
@@ -227,7 +235,7 @@ def batch_convert(
                 output_path=out_path,
                 mode=mode,
                 preserve_metadata=preserve_metadata,
-                include_alpha=(mode == 'LA' or (infile.suffix.lower() in ('.png', '.webp') and mode == 'L' and False)),
+                include_alpha=include_alpha or (mode == 'LA'),
                 output_format=output_format,
                 quality=quality,
             )
@@ -278,62 +286,79 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    input_path = Path(args.input)
+    try:
+        input_path = Path(args.input)
 
-    # Quick path validation
-    if not input_path.exists():
-        print(f"Error: Input path not found: {input_path}", file=sys.stderr)
-        return 2
+        # Resolve and basic safety checks
+        if not input_path.exists():
+            print(f"Error: Input path not found: {input_path}", file=sys.stderr)
+            return 2
 
-    # Decide if single file or directory
-    if input_path.is_file():
-        # Single image mode
-        # Determine output path
-        if args.output:
-            out_path = Path(args.output)
-            if out_path.exists() and out_path.is_dir():
-                out_path = out_path / f"bw_{input_path.stem}{_ext_from_format(args.output_format, args.mode if not args.include_alpha else 'LA')}"
-            # else treat as file path
-        else:
-            ext = _ext_from_format(args.output_format, args.mode if not args.include_alpha else 'LA')
-            out_path = input_path.parent / f"bw_{input_path.stem}{ext}"
-
-        if out_path.exists() and not args.overwrite:
-            print(f"Output file already exists and overwrite is disabled: {out_path}", file=sys.stderr)
-            return 1
-
+        # Ensure input is within base directory
         try:
-            convert_image_to_grayscale(
-                input_path=input_path,
-                output_path=out_path,
-                mode=args.mode,
-                preserve_metadata=args.preserve_metadata,
-                include_alpha=args.include_alpha,
-                output_format=args.output_format,
-                quality=args.quality,
-            )
-            return 0
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+            _validate_within_base(input_path)
+        except ValueError as ve:
+            print(f"Error: {ve}", file=sys.stderr)
+            return 2
 
-    else:
-        # Directory mode
-        output_dir = None
-        if args.output:
-            output_dir = Path(args.output)
-            if output_dir.exists() and not output_dir.is_dir():
-                print(f"Output path exists and is not a directory: {output_dir}", file=sys.stderr)
+        # Decide if single file or directory
+        if input_path.is_file():
+            # Single image mode
+            ext = _ext_from_format(args.output_format)
+
+            # Determine final output path
+            if args.output:
+                out_path = Path(args.output)
+                if out_path.exists() and out_path.is_dir():
+                    out_path = out_path / f"bw_{input_path.stem}{ext}"
+            else:
+                out_path = input_path.parent / f"bw_{input_path.stem}{ext}"
+
+            # Safety: ensure path inside base
+            try:
+                out_path = _validate_within_base(out_path)
+            except ValueError:
+                print("Error: Output path is outside the allowed base directory.", file=sys.stderr)
                 return 2
+
+            if out_path.exists() and not args.overwrite:
+                print(f"Output file already exists and overwrite is disabled: {out_path}", file=sys.stderr)
+                return 1
+
+            try:
+                convert_image_to_grayscale(
+                    input_path=input_path,
+                    output_path=out_path,
+                    mode=args.mode,
+                    preserve_metadata=args.preserve_metadata,
+                    include_alpha=args.include_alpha,
+                    output_format=args.output_format,
+                    quality=args.quality,
+                )
+                return 0
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 1
+
         else:
-            output_dir = input_path.parent / (input_path.name + "_gray")
+            # Directory/batch mode
+            input_dir = input_path
+            output_dir = None
+            if args.output:
+                output_dir = Path(args.output)
+            else:
+                output_dir = input_dir.parent / (input_dir.name + "_gray")
 
-        # Prepare extension decisions for batch internal operations
-        keep_structure = bool(args.keep_structure)
+            # Safety: ensure dirs inside base
+            try:
+                input_dir = _validate_within_base(input_dir)
+                output_dir = _validate_within_base(output_dir)
+            except ValueError as ve:
+                print(f"Error: {ve}", file=sys.stderr)
+                return 2
 
-        try:
             results = batch_convert(
-                input_dir=input_path,
+                input_dir=input_dir,
                 output_dir=output_dir,
                 recursive=args.recursive,
                 extensions=args.extensions,
@@ -342,15 +367,19 @@ def main() -> int:
                 preserve_metadata=args.preserve_metadata,
                 output_format=args.output_format,
                 quality=args.quality,
-                keep_structure=keep_structure,
+                keep_structure=args.keep_structure if args.keep_structure is not None else True,
+                include_alpha=args.include_alpha,
                 progress=args.progress,
             )
-            # Optional: print summary
             print(f"Processed {len(results)} file(s).", file=sys.stdout)
             return 0
-        except Exception as e:
-            print(f"Batch processing failed: {e}", file=sys.stderr)
-            return 1
+
+    except ValueError as ve:
+        print(f"Error: {ve}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
