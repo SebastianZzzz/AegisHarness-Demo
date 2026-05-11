@@ -603,36 +603,46 @@ class SimpleCalculatorUI:
         self._refresh_result()
 
     def _button_press(self, label: str):
+        # Clear current entry
         if label == "CE":
-            self.expression = self.expression[:-1]
-        elif label == "C" or label == "CE":
+            self.expression = ""
+            self._update_expr_display()
+            return
+        # Clear all / reset
+        if label == "C":
             self.expression = ""
             self.result_var.set("")
-        elif label == "=" or label == "==":
+            self._update_expr_display()
+            return
+        if label == "=":
             self._evaluate()
             return
-        elif label == "⌫":
+        if label == "⌫":
             self._backspace()
             return
-        elif label in ("pi","e"):
+        if label in ("pi","e"):
             self.expression += label
-        elif label in ("sin","cos","tan","sqrt","log","ln","abs","fact","M+","M-","MR","MC"):
-            if label in ("M+","M-","MR","MC"):
-                # map to simple memory operations
-                if label == "MR":
-                    val = self.engine.memory_recall()
-                    self.expression += str(val)
-                elif label == "MC":
-                    self.engine.memory_clear()
-                elif label == "M+":
-                    self.engine.memory_store.add(self._parse_last_result())
-                elif label == "M-":
-                    self.engine.memory_store.sub(self._parse_last_result())
-            else:
-                # append function call with opening paren
-                self.expression += label + "("
-        else:
-            self.expression += label
+            self._update_expr_display()
+            return
+        if label in ("sin","cos","tan","sqrt","log","ln","abs","fact","cbrt"):
+            # append function call with opening paren
+            self.expression += label + "("
+            self._update_expr_display()
+            return
+        if label in ("M+","M-","MR","MC"):
+            if label == "MR":
+                val = self.engine.memory_recall()
+                self.expression += str(val)
+            elif label == "MC":
+                self.engine.memory_clear()
+            elif label == "M+":
+                self.engine.memory_add(self._parse_last_result())
+            elif label == "M-":
+                self.engine.memory_sub(self._parse_last_result())
+            self._update_expr_display()
+            return
+        # Default: append (numbers, operators, etc.)
+        self.expression += label
         self._update_expr_display()
 
     def _parse_last_result(self) -> float:
