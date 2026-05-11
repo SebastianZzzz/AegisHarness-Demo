@@ -251,7 +251,7 @@ class ExpressionParser:
 
     def _op_precedence(self, op: str) -> int:
         if op == 'u-':
-            return 3  # unary minus lower than exponent
+            return 3  # unary minus
         if op in ('**', '^'):
             return 4  # exponent
         if op in ('*','/','%'):
@@ -603,31 +603,39 @@ class SimpleCalculatorUI:
         self._refresh_result()
 
     def _button_press(self, label: str):
+        # Clear/Backspace/Evaluate handling with reviewer fixes
         if label == "CE":
-            self.expression = self.expression[:-1]
-        elif label == "C" or label == "CE":
+            # Clear current entry
+            self.expression = ""
+            self._update_expr_display()
+            return
+        if label == "C":
+            # All clear: clear expression and result
             self.expression = ""
             self.result_var.set("")
-        elif label == "=" or label == "==":
-            self._evaluate()
+            self._update_expr_display()
             return
-        elif label == "⌫":
+        if label == "⌫":
             self._backspace()
             return
-        elif label in ("pi","e"):
+        if label == "=" or label == "==":
+            self._evaluate()
+            return
+
+        # Memory and functions
+        if label in ("pi","e"):
             self.expression += label
         elif label in ("sin","cos","tan","sqrt","log","ln","abs","fact","M+","M-","MR","MC"):
-            if label in ("M+","M-","MR","MC"):
-                # map to simple memory operations
+            if label in ("MR","MC","M+","M-"):
                 if label == "MR":
                     val = self.engine.memory_recall()
                     self.expression += str(val)
                 elif label == "MC":
                     self.engine.memory_clear()
                 elif label == "M+":
-                    self.engine.memory_store.add(self._parse_last_result())
+                    self.engine.memory_add(self._parse_last_result())
                 elif label == "M-":
-                    self.engine.memory_store.sub(self._parse_last_result())
+                    self.engine.memory_sub(self._parse_last_result())
             else:
                 # append function call with opening paren
                 self.expression += label + "("
