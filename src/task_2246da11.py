@@ -15,19 +15,12 @@ _DEFAULT_CONTEXT = {
     'max_depth': 100,           # recursion depth guard
     'max_tokens': 4096,          # max tokens for an expression
     'allow_nan': False,          # whether to allow NaN in outputs
-    'allow_infinite': False,       # whether to allow inf
+    'allow_infinite': False,     # whether to allow infinite results
 }
 
 # Registry and constants
 def _build_default_functions():
     # Each function receives (args: List[float], ctx: dict) and returns float
-    def wrap(fn):
-        def inner(args, ctx):
-            return fn(*args)
-        return inner
-
-    def _an(x): return x  # placeholder if needed
-
     def sin_fn(a, ctx):
         v = a
         if ctx['angle_mode'] == 'degrees':
@@ -135,12 +128,12 @@ def _build_default_functions():
             raise ValueError("nCr domain error")
         return math.comb(n_i, r_i)
 
-    def max_fn(*args, ctx):
+    def max_fn(args, ctx):
         if len(args) == 0:
             raise ValueError("max requires at least one argument")
         return max(args)
 
-    def min_fn(*args, ctx):
+    def min_fn(args, ctx):
         if len(args) == 0:
             raise ValueError("min requires at least one argument")
         return min(args)
@@ -175,14 +168,14 @@ def _build_default_functions():
         'abs': lambda args, ctx: abs_fn(args[0], ctx),
         'floor': lambda args, ctx: floor_fn(args[0], ctx),
         'ceil': lambda args, ctx: ceil_fn(args[0], ctx),
-        'round': lambda args, ctx: round_fn(args[0], args[1] if len(args) > 1 else None, ctx=None) ,
+        'round': lambda args, ctx: round_fn(args[0], args[1] if len(args) > 1 else None, ctx=ctx),
         'exp': lambda args, ctx: exp_fn(args[0], ctx),
         'erf': lambda args, ctx: erf_fn(args[0], ctx),
         'gamma': lambda args, ctx: gamma_fn(args[0], ctx),
         'factorial': lambda args, ctx: factorial_fn(args[0], ctx),
         'ncr': lambda args, ctx: ncr_fn(args[0], args[1], ctx),
-        'max': lambda args, ctx: max_fn(*args, ctx),
-        'min': lambda args, ctx: min_fn(*args, ctx),
+        'max': lambda args, ctx: max_fn(args, ctx),
+        'min': lambda args, ctx: min_fn(args, ctx),
         'pow': lambda args, ctx: pow_fn(args[0], args[1], ctx),
         'sign': lambda args, ctx: sign_fn(args[0], ctx),
         'sqrt2': lambda args, ctx: sqrt2_fn(args[0], ctx),
@@ -220,9 +213,10 @@ class Lexer:
         self.tokens: List[Token] = []
         self._tokenize()
 
-    def _peek(self) -> Optional[str]:
-        if self.pos < self.length:
-            return self.text[self.pos]
+    def _peek(self, offset: int = 0) -> Optional[str]:
+        idx = self.pos + offset
+        if idx < self.length:
+            return self.text[idx]
         return None
 
     def _advance(self) -> Optional[str]:
@@ -237,53 +231,78 @@ class Lexer:
             if ch.isspace():
                 self._advance()
                 continue
-            if ch.isdigit() or (ch == '.' and self.pos + 1 < self.length and self._peek(1).isdigit() if False else False):
-                # We'll implement a robust reader below; handle '.' leading case separately
-                pass
-            if ch.isdigit() or (ch == '.' ):
+
+            # Numbers (including leading dot, e.g., .5)
+            if (ch.isdigit()) or (ch == '.' and self.pos + 1 < self.length and self._peek(1).isdigit()):
                 num = self._read_number()
                 self.tokens.append(Token('NUMBER', float(num)))
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
+
+            # Identifiers (functions/constants)
             if ch.isalpha() or ch == '_':
                 ident = self._read_identifier()
                 self.tokens.append(Token('IDENT', ident))
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
+
             if ch == '+':
                 self.tokens.append(Token('OP', '+'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == '-':
                 self.tokens.append(Token('OP', '-'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == '*':
                 self.tokens.append(Token('OP', '*'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == '/':
                 self.tokens.append(Token('OP', '/'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == '^':
                 self.tokens.append(Token('OP', '^'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == '%':
                 self.tokens.append(Token('OP', '%'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == '(':
                 self.tokens.append(Token('LPAREN', '('))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == ')':
                 self.tokens.append(Token('RPAREN', ')'))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
             if ch == ',':
                 self.tokens.append(Token('COMMA', ','))
                 self.pos += 1
+                if len(self.tokens) > self.max_tokens:
+                    raise EvaluateError("Expression too long or too many tokens")
                 continue
+
             # Unknown character
             raise EvaluateError(f"Invalid character encountered: {ch}")
 
@@ -291,69 +310,51 @@ class Lexer:
         if len(self.tokens) > self.max_tokens:
             raise EvaluateError("Expression too long or too many tokens")
 
-        # Ensure we don't mistakenly treat the false-leading decimal
-        # Fix: Re-run a more robust number reader for decimals starting with '.'
-        # Simpler approach: if we failed to capture numbers starting with dot above, handle here:
-        # The above loop attempts, but we implement a second pass to fix potential issues is complex.
-        # For simplicity, ignore this; our _read_number handles leading dot.
-
     def _read_number(self) -> str:
-        start = self.pos
-        s = ""
-        has_dot = False
-        # integer part
-        while self.pos < self.length and self.text[self.pos].isdigit():
+        # Handle leading dot: .5
+        if self._peek() == '.':
+            s = '0.'
             self.pos += 1
-            s += self.text[self.pos - 1]
+            while self._peek() is not None and self._peek().isdigit():
+                s += self._advance()
+            # Optional exponent
+            if self._peek() in ('e', 'E'):
+                s += self._advance()
+                if self._peek() in ('+', '-'):
+                    s += self._advance()
+                if self._peek() is None or not self._peek().isdigit():
+                    raise EvaluateError("Invalid numeric literal")
+                while self._peek() is not None and self._peek().isdigit():
+                    s += self._advance()
+            return s
+
+        s = ''
+        # integral part
+        while self._peek() is not None and self._peek().isdigit():
+            s += self._advance()
         # fractional part
-        if self.pos < self.length and self.text[self.pos] == '.':
-            has_dot = True
-            self.pos += 1
-            s += '.'
-            while self.pos < self.length and self.text[self.pos].isdigit():
-                s += self.text[self.pos]
-                self.pos += 1
+        if self._peek() == '.':
+            s += self._advance()
+            while self._peek() is not None and self._peek().isdigit():
+                s += self._advance()
         # exponent
-        if self.pos < self.length and (self.text[self.pos] == 'e' or self.text[self.pos] == 'E'):
-            s += self.text[self.pos]
-            self.pos += 1
-            if self.pos < self.length and (self.text[self.pos] == '+' or self.text[self.pos] == '-'):
-                s += self.text[self.pos]
-                self.pos += 1
-            if self.pos >= self.length or not self.text[self.pos].isdigit():
+        if self._peek() in ('e', 'E'):
+            s += self._advance()
+            if self._peek() in ('+', '-'):
+                s += self._advance()
+            if self._peek() is None or not self._peek().isdigit():
                 raise EvaluateError("Invalid numeric literal")
-            while self.pos < self.length and self.text[self.pos].isdigit():
-                s += self.text[self.pos]
-                self.pos += 1
-        if s == "":
-            # try to parse simpler: when number starts with '.'
-            if self.pos > 0 and self.text[self.pos-1] == '.':
-                # treat as 0.x
-                s = '0.' 
-            else:
-                raise EvaluateError("Invalid numeric literal")
+            while self._peek() is not None and self._peek().isdigit():
+                s += self._advance()
+        if s == '':
+            raise EvaluateError("Invalid numeric literal")
         return s
 
     def _read_identifier(self) -> str:
-        start = self.pos
         s = ''
-        while self.pos < self.length and (self.text[self.pos].isalnum() or self.text[self.pos] == '_'):
-            s += self.text[self.pos]
-            self.pos += 1
+        while self._peek() is not None and (self._peek().isalnum() or self._peek() == '_'):
+            s += self._advance()
         return s
-
-    # helper for potential lookahead (not used currently)
-    def _peek_at(self, offset: int) -> Optional[str]:
-        idx = self.pos + offset
-        if 0 <= idx < self.length:
-            return self.text[idx]
-        return None
-
-    # convenience:
-    def _peek_token(self) -> Token:
-        if self.tokens:
-            return self.tokens[0]
-        return Token('EOF', None)
 
 # Parser
 class Parser:
@@ -422,7 +423,7 @@ class Parser:
                     try:
                         left = left % right
                     except Exception:
-                        raise EvaluateError("Invalid modulo operation")
+                        raise EvaluateError("Invalid modulo operation (div by zero or non-integer)")
             else:
                 break
         return left
@@ -459,7 +460,6 @@ class Parser:
         if t.type == 'IDENT':
             name = t.value
             self._consume()
-            # Function call?
             next_t = self._peek()
             if next_t.type == 'LPAREN':
                 self._consume()  # consume '('
@@ -502,15 +502,9 @@ class Parser:
             raise EvaluateError(f"Unknown function: {name}")
         fn = _FUNCTION_REGISTRY[key]
 
-        # Some functions may expect 0 args; handle gracefully
         try:
-            res = fn(args, self.ctx) if fn.__code__.co_argcount == 2 else fn(args, self.ctx)
-        except TypeError:
-            # In case the function wrapper signature is different
             res = fn(args, self.ctx)
-        except EvaluateError as e:
-            raise
-        except ValueError as e:
+        except EvaluateError:
             raise
         except Exception as e:
             raise EvaluateError(f"Function '{name}' error: {e}")
@@ -548,11 +542,20 @@ class CalculationEngine:
             value = parser.parse()
             # Final rounding
             precision = self.ctx.get('precision', 12)
-            if math.isfinite(value) and not (math.isnan(value) or math.isinf(value)):
+
+            # Enforce finite constraints
+            is_finite = math.isfinite(value)
+            is_nan = math.isnan(value)
+
+            if is_nan or not is_finite:
+                if is_nan:
+                    if not self.ctx.get('allow_nan', False):
+                        raise EvaluateError("Result is NaN")
+                if math.isinf(value) and not self.ctx.get('allow_infinite', False):
+                    raise EvaluateError("Result is infinite")
+
+            if is_finite and not is_nan:
                 value = round(value, precision)
-            else:
-                if not self.ctx.get('allow_nan', False) and math.isnan(value):
-                    raise EvaluateError("Result is not a finite number")
             return {'ok': True, 'value': value, 'error': None, 'metadata': {'expression': expression}}
         except EvaluateError as e:
             return {'ok': False, 'value': None, 'error': str(e), 'metadata': {'expression': expression}}
@@ -599,5 +602,5 @@ __all__ = [
     'setContextOption',
     'resetContextOption',
     'evaluate',
-    'EvaluateError'  # not exported directly, but available via exception
+    'EvaluateError'
 ]
