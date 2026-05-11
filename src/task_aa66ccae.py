@@ -1,325 +1,312 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import logging
+import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, Optional, Tuple
+from typing import Optional, Iterator
 
-try:
-    from PIL import Image, ImageOps
-except Exception as e:
-    sys.stderr.write(f"ERROR: Pillow is required to run this script: {e}\n")
-    sys.exit(2)
-
-# Optional progress bar (tqdm)
-_TQDM_AVAILABLE = False
 try:
     from tqdm import tqdm  # type: ignore
-    _TQDM_AVAILABLE = True
+    HAS_TQDM = True
 except Exception:
-    _TQDM_AVAILABLE = False
+    HAS_TQDM = False
+    tqdm = None  # type: ignore
 
-ALLOWED_EXTS = {
-    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"
-}
+from PIL import Image, ImageOps
 
-
-@dataclass
-class Options:
-    input_path: Path
-    output_dir: Optional[Path]
-    recursive: bool
-    force_format: Optional[str]
-    method: str  # 'L' or 'LA'
-    max_size: Optional[int]
-    preserve_metadata: bool
-    overwrite: bool
-    suffix: str
-    apply_orientation: bool
-    verbose: int
-    show_progress: bool
-
-
-def _setup_logging(verbose: int) -> None:
-    if verbose >= 2:
-        level = logging.DEBUG
-    elif verbose == 1:
-        level = logging.INFO
-    else:
-        level = logging.WARNING
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+# Supported image extensions
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
 
 
 def is_image_file(p: Path) -> bool:
-    if not p.is_file():
-        return False
-    if p.suffix.lower() in ALLOWED_EXTS:
-        return True
-    try:
-        with Image.open(p) as im:
-            im.verify()
-        return True
-    except Exception:
-        return False
+    return p.suffix.lower() in IMAGE_EXTS
 
 
-def enumerate_images(input_path: Path, recursive: bool) -> Generator[Path, None, None]:
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input path does not exist: {input_path}")
-    if input_path.is_file():
-        if is_image_file(input_path):
-            yield input_path
-        return
+def enumerate_images(input_path: Path, recursive: bool) -> Iterator[Path]:
     if input_path.is_dir():
         if recursive:
-            for p in input_path.rglob("*"):
-                if p.is_file() and is_image_file(p):
-                    yield p
+            for root, _, files in os.walk(input_path):
+                for name in files:
+                    p = Path(root) / name
+                    if is_image_file(p):
+                        yield p
         else:
             for p in input_path.iterdir():
                 if p.is_file() and is_image_file(p):
                     yield p
+    elif input_path.is_file():
+        if is_image_file(input_path):
+            yield input_path
     else:
-        raise FileNotFoundError(f"Input path is not a file or directory: {input_path}")
+        return
 
 
-def build_output_path(
-    input_path: Path,
-    output_dir: Optional[Path],
-    suffix: str,
-    force_format: Optional[str],
-) -> Path:
-    out_dir = Path(output_dir) if output_dir else input_path.parent
-    out_dir = out_dir.resolve()
+def build_output_path(input_path: Path, output_dir: Optional[Path], suffix: str,
+                      force_format: Optional[str]) -> Path:
+    input_path = input_path.resolve()
+    if output_dir is None:
+        out_dir = input_path.parent
+    else:
+        out_dir = output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = input_path.stem
-    ext = (force_format or input_path.suffix[1:]).lower()
-    out_name = f"{stem}{suffix}.{ext}"
-    return out_dir / out_name
+    base = input_path.stem
+    if force_format:
+        ext_out = f".{force_format.lower().lstrip('.')}"
+    else:
+        ext_out = input_path.suffix
+    out_filename = f"{base}{suffix}{ext_out}"
+    return out_dir / out_filename
 
 
-def _load_image_preserving_paths(path: Path) -> Tuple[Image.Image, Optional[bytes], Optional[bytes]]:
+def grayscale_image(img: Image.Image, method: str) -> Image.Image:
     """
-    Open the image safely and return a PIL Image object along with its EXIF bytes and ICC profile if available.
-    Performs a verify() pass to catch corrupted files before processing.
-    Returns the loaded image (reopened) and its exif bytes and icc profile bytes (or None).
+    Convert an image to grayscale based on method.
+    method: 'L' or 'LA'
+    - 'L': convert to single-channel luminance (alpha dropped)
+    - 'LA': convert to luminance while preserving alpha channel (if present),
+            otherwise adds a fully opaque alpha
     """
-    try:
-        # First pass: verify integrity
-        with Image.open(path) as im:
-            im.verify()
-
-        # Second pass: actual loading
-        with Image.open(path) as im:
-            exif_bytes = im.info.get("exif")
-            icc_profile = im.info.get("icc_profile")
-            return im.copy(), exif_bytes, icc_profile
-    except Exception as e:
-        raise ValueError(f"Failed to load image '{path}': {e}") from e
-
-
-def apply_orientation_if_needed(img: Image.Image, apply_orientation: bool) -> Image.Image:
-    if apply_orientation:
-        try:
-            return ImageOps.exif_transpose(img)
-        except Exception:
-            # If something goes wrong, return the original image
-            return img
-    return img
-
-
-def _resize_image(img: Image.Image, max_size: Optional[int]) -> Image.Image:
-    if not max_size or max_size <= 0:
-        return img
-    w, h = img.size
-    max_dim = max(w, h)
-    if max_dim <= max_size:
-        return img
-    scale = max_size / float(max_dim)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    return img.resize((new_w, new_h), resample=Image.LANCZOS)
-
-
-def grayscale_image(img: Image.Image, method: str, preserve_alpha: bool) -> Image.Image:
     method = method.upper()
-    if method not in ("L", "LA"):
+    if method == 'L':
+        return img.convert('L')
+    elif method == 'LA':
+        gray = img.convert('L')
+        bands = img.getbands()
+        if 'A' in bands:
+            a = img.getchannel('A')
+        else:
+            a = Image.new('L', img.size, 255)
+        return Image.merge('LA', (gray, a))
+    else:
         raise ValueError(f"Unsupported grayscale method: {method}")
 
-    if method == "L":
-        if preserve_alpha and img.mode == "RGBA":
-            rgb = img.convert("RGB")
-            gray = rgb.convert("L")
-            a = img.getchannel("A")
-            return Image.merge("LA", (gray, a))
-        else:
-            return img.convert("L")
-    else:  # LA
-        # Ensure we have an alpha channel to preserve
-        if img.mode == "RGBA":
-            return img.convert("LA")
-        else:
-            # Promote to RGBA, then to LA (alpha 255)
-            return img.convert("RGBA").convert("LA")
 
-
-def process_image(input_path: Path, options: Options) -> Tuple[bool, str]:
+def safe_open(input_path: Path) -> Image.Image:
     """
-    Process a single image. Returns (success, message)
+    Open an image safely and verify integrity.
+    Returns a Pillow Image object.
     """
-    try:
-        out_path = build_output_path(input_path, options.output_dir, options.suffix, options.force_format)
-        if out_path.exists() and not options.overwrite:
-            logging.info(f"SKIP: Output exists and overwrite disabled -> {out_path}")
-            return True, f"skipped (exists): {out_path}"
-
-        # Load with verification and preserve metadata if requested
-        img, exif_bytes, icc_profile = _load_image_preserving_paths(input_path)
-
-        # Orientation handling
-        img = apply_orientation_if_needed(img, options.apply_orientation)
-
-        # Resize if requested
-        img = _resize_image(img, options.max_size)
-
-        # Grayscale conversion
-        img = grayscale_image(img, options.method, options.preserve_metadata)
-
-        # Prepare save parameters
-        save_kwargs = {}
-        if options.preserve_metadata:
-            if exif_bytes:
-                save_kwargs["exif"] = exif_bytes
-            if icc_profile:
-                save_kwargs["icc_profile"] = icc_profile
-
-        # Save
-        if options.force_format:
-            img.save(out_path, format=options.force_format.upper(), **save_kwargs)
-        else:
-            img.save(out_path, **save_kwargs)
-
-        logging.info(f"OK: {input_path} -> {out_path}")
-        return True, f"saved: {out_path}"
-    except Exception as e:
-        logging.error(f"FAILED: {input_path} -> error: {e}")
-        return False, f"failed: {e}"
+    with Image.open(input_path) as im:
+        try:
+            im.verify()  # validate integrity
+        except Exception as e:
+            raise e
+    # Reopen for actual processing
+    return Image.open(input_path)
 
 
-def collect_stats(results: list) -> dict:
-    total = len(results)
-    successes = sum(1 for ok, _ in results if ok)
-    failures = total - successes
-    return {
-        "total": total,
-        "successes": successes,
-        "failures": failures,
-    }
+def process_image(input_path: Path,
+                  method: str,
+                  apply_orientation: bool,
+                  max_size: Optional[int]) -> Image.Image:
+    """
+    Open and process a single image: orientation (optional), resize (optional),
+    then grayscale according to method.
+    Returns the processed PIL Image (not yet saved).
+    """
+    with Image.open(input_path) as img:
+        if apply_orientation:
+            img = ImageOps.exif_transpose(img)
+
+        if max_size is not None and max_size > 0:
+            w, h = img.size
+            if w > max_size or h > max_size:
+                scale = min(max_size / float(w), max_size / float(h))
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                img = img.resize((new_w, new_h), resample=Image.LANCZOS)
+
+        processed = grayscale_image(img, method)
+        if processed is None:
+            raise RuntimeError("Failed to convert image to grayscale.")
+        # If orientation applied, ensure we still have the proper data
+        return processed.copy()  # return an independent image
 
 
-def display_summary(stats: dict, duration_seconds: float) -> None:
-    logging.info("Processing Summary:")
-    logging.info(f"  Total images: {stats['total']}")
-    logging.info(f"  Successful: {stats['successes']}")
-    logging.info(f"  Failed: {stats['failures']}")
-    logging.info(f"  Time elapsed: {duration_seconds:.2f}s")
+def read_exif_and_icc(img: Image.Image) -> tuple[Optional[bytes], Optional[bytes]]:
+    exif = img.info.get('exif')
+    icc = img.info.get('icc_profile')
+    return exif, icc
 
 
-def parse_args(argv: Optional[list] = None) -> Tuple[Options, Optional[Path], Optional[bool]]:
+def ensure_parent_dir(p: Path):
+    p_parent = p.parent
+    p_parent.mkdir(parents=True, exist_ok=True)
+
+
+def main():
     parser = argparse.ArgumentParser(
-        prog="grayscale.py",
-        description="Convert images to grayscale using Pillow with optional metadata preservation."
+        description="Convert images to grayscale using Pillow. Supports batch processing, "
+                    "optional resizing, and metadata preservation."
     )
+    parser.add_argument('-i', '--input', required=True,
+                        help='Path to an image file or a directory containing images.')
+    parser.add_argument('-o', '--output', required=False,
+                        help='Output directory. If omitted, outputs are saved next to inputs with suffix.')
+    parser.add_argument('-r', '--recursive', action='store_true',
+                        help='Process directories recursively (default: false).')
+    parser.add_argument('-f', '--force-format', required=False,
+                        help='Force output format (e.g., png, jpeg).')
+    parser.add_argument('-m', '--method', choices=['L', 'LA'], default='L',
+                        help="Grayscale method: 'L' (default) or 'LA' to preserve alpha.")
+    parser.add_argument('-s', '--maximize-size', type=int, default=None,
+                        help='Maximum width/height for processed images (maintains aspect ratio).')
+    parser.add_argument('--preserve-metadata', dest='preserve_metadata', action='store_true',
+                        help='Preserve EXIF and ICC metadata when saving (default).')
+    parser.add_argument('--no-preserve-metadata', dest='preserve_metadata', action='store_false',
+                        help='Do not preserve EXIF/ICC metadata when saving.')
+    parser.add_argument('--overwrite', dest='overwrite', action='store_true',
+                        help='Overwrite existing output files.')
+    parser.add_argument('--no-overwrite', dest='overwrite', action='store_false',
+                        help='Do not overwrite existing output files (default).')
+    parser.add_argument('-u', '--suffix', default='_gray',
+                        help='Suffix to append to output filenames (default "_gray").')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Suppress informational logs.')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Increase logging verbosity for debugging.')
+    parser.add_argument('--progress', dest='progress', action='store_true',
+                        help='Show a progress bar during batch processing.')
+    parser.add_argument('--no-progress', dest='progress', action='store_false',
+                        help='Do not show a progress bar during batch processing.')
+    parser.set_defaults(progress=HAS_TQDM)
 
-    parser.add_argument("-i", "--input", dest="input", required=True, help="Path to an image file or directory")
-    parser.add_argument("-o", "--output", dest="output", help="Output directory (optional). Defaults to input dir with suffix.")
-    parser.add_argument("-r", "--recursive", dest="recursive", action="store_true", help="Process directories recursively")
-    parser.add_argument("-f", "--force-format", dest="force_format", help="Force output format (e.g., png, jpeg).")
-    parser.add_argument("-m", "--method", dest="method", choices=["L", "LA"], default="L", help="Grayscale method: L or LA (default: L)")
-    parser.add_argument("-s", "--maximize-size", dest="max_size", type=int, default=None, help="Maximum dimension (width/height) to resize to")
-    parser.add_argument("--preserve-metadata", dest="preserve_metadata", action="store_true", default=True, help="Preserve EXIF and ICC data (default: true)")
-    parser.add_argument("--no-preserve-metadata", dest="preserve_metadata", action="store_false", help="Do not preserve metadata")
-    parser.add_argument("--overwrite", dest="overwrite", action="store_true", default=False, help="Overwrite existing outputs")
-    parser.add_argument("--no-overwrite", dest="overwrite", action="store_false", help="Do not overwrite existing outputs (default)")
-    parser.add_argument("-u", "--suffix", dest="suffix", default="_gray", help="Suffix to append to output filenames (default: _gray)")
-    parser.add_argument("--apply-orientation", dest="apply_orientation", action="store_true", default=True, help="Apply EXIF orientation before processing")
-    parser.add_argument("--no-apply-orientation", dest="apply_orientation", action="store_false", help="Do not apply EXIF orientation before processing")
-    parser.add_argument("-v", "--verbose", dest="verbose", action="count", default=0, help="Increase verbosity (can be repeated)")
-    parser.add_argument("--progress", dest="progress", action="store_true", default=False, help="Show progress bar during batch processing")
-    parser.add_argument("--no-progress", dest="progress", action="store_false", help="Hide progress bar during batch processing")
+    args = parser.parse_args()
 
-    ns = parser.parse_args(argv)
-
-    input_path = Path(ns.input).expanduser().resolve()
-
-    if ns.output:
-        output_dir = Path(ns.output).expanduser().resolve()
+    # Logging configuration
+    if args.verbose:
+        log_level = logging.DEBUG
+    elif args.quiet:
+        log_level = logging.WARNING
     else:
-        output_dir = None
+        log_level = logging.INFO
+    logging.basicConfig(level=log_level,
+                        format='[%(levelname)s] %(message)s')
 
-    options = Options(
-        input_path=input_path,
-        output_dir=output_dir,
-        recursive=bool(ns.recursive),
-        force_format=ns.force_format,
-        method=ns.method,
-        max_size=ns.max_size,
-        preserve_metadata=bool(ns.preserve_metadata),
-        overwrite=bool(ns.overwrite),
-        suffix=ns.suffix,
-        apply_orientation=bool(ns.apply_orientation),
-        verbose=int(ns.verbose),
-        show_progress=bool(ns.progress),
-    )
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logging.error("Input path does not exist: %s", input_path)
+        sys.exit(2)
 
-    show_progress_default = _TQDM_AVAILABLE
-    if options.show_progress is False:
-        show_progress_default = False
-    elif options.show_progress is True:
-        show_progress_default = True
-    # return parsed options and a placeholder for potential tests
-    return options, input_path, show_progress_default
+    # Resolve output directory
+    output_dir = None
+    if args.output:
+        output_dir = Path(args.output).expanduser().resolve()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logging.error("Cannot create output directory: %s (%s)", output_dir, e)
+            sys.exit(2)
 
+    # Validate input type
+    if not (input_path.is_file() or input_path.is_dir()):
+        logging.error("Input path is not a file or directory: %s", input_path)
+        sys.exit(2)
 
-def main(argv: Optional[list] = None) -> int:
-    options, input_path, _ = parse_args(argv)
+    # Enumerate images
+    image_paths = list(enumerate_images(input_path, args.recursive))
+    if not image_paths:
+        logging.info("No supported image files found in the given path.")
+        sys.exit(0)
 
-    _setup_logging(options.verbose)
+    total = len(image_paths)
+    logging.info("Found %d image(s) to process.", total)
 
+    successes = 0
+    failures = 0
     start_time = time.time()
 
-    try:
-        image_paths = list(enumerate_images(options.input_path, options.recursive))
-    except Exception as e:
-        logging.error(f"Input enumeration failed: {e}")
-        return 2
+    # Progress wrapper
+    iterator = enumerate_images(input_path, args.recursive)
+    if args.progress and HAS_TQDM:
+        iterator = tqdm(image_paths, desc="Processing images", unit="file")
 
-    if not image_paths:
-        logging.warning("No image files found to process.")
-        return 0
+    # Process each image
+    for in_path in image_paths:
+        try:
+            in_path = Path(in_path)
+            # Open and verify (robust against corrupt files)
+            with Image.open(in_path) as _tmp:
+                _ = _tmp.verify()
+            processed: Image.Image = process_image(
+                in_path,
+                method=args.method,
+                apply_orientation=True,  # always apply orientation to ensure consistent grayscale output
+                max_size=args.maximize_size
+            )
 
-    total_count = len(image_paths)
-    results = []
-    if options.show_progress and _TQDM_AVAILABLE:
-        iterator = tqdm(image_paths, total=total_count, desc="Converting")
-        it = iterator
-    else:
-        it = image_paths
+            # Prepare output path
+            out_path = build_output_path(
+                in_path,
+                output_dir,
+                args.suffix,
+                args.force_format
+            )
 
-    # Process images
-    for p in it:
-        ok, msg = process_image(p, options)
-        results.append((ok, msg))
+            if out_path.exists() and not args.overwrite:
+                logging.warning("Output exists and overwrite disabled: %s", out_path)
+                failures += 1
+                continue
 
-    duration = time.time() - start_time
-    stats = collect_stats(results)
-    display_summary(stats, duration)
+            # Metadata handling
+            exif, icc = (None, None)  # default
+            # Read metadata from the source image (only if preservation requested)
+            with Image.open(in_path) as src_img:
+                if args.preserve_metadata:
+                    exif, icc = read_exif_and_icc(src_img)
 
-    # Return code: 0 if all success, 1 if some failed
-    return 0 if stats["failures"] == 0 else 1
+            # If saving to JPEG and method == 'LA', alpha cannot be stored; convert to 'L'
+            save_as = None
+            if args.force_format:
+                save_as = args.force_format.upper()
+            else:
+                save_ext = out_path.suffix.lower().lstrip('.')
+                save_as = save_ext.upper()
+
+            if save_as in ('JPEG', 'JPG') and args.method == 'LA':
+                processed = processed.convert('L')
+
+            ensure_parent_dir(out_path)
+
+            save_kw = {}
+            if args.preserve_metadata:
+                if exif is not None:
+                    save_kw['exif'] = exif
+                if icc is not None:
+                    save_kw['icc_profile'] = icc
+
+            # Save with or without explicit format to rely on extension
+            if args.force_format:
+                processed.save(out_path, format=args.force_format.upper(), **save_kw)
+            else:
+                processed.save(out_path, **save_kw)
+
+            logging.info("Saved: %s", out_path)
+            successes += 1
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user.")
+            break
+        except Exception as e:
+            logging.error("Failed processing '%s': %s", in_path, e)
+            failures += 1
+
+    elapsed = time.time() - start_time
+    summary = {
+        'total': total,
+        'successes': successes,
+        'failures': failures,
+        'elapsed_sec': round(elapsed, 2)
+    }
+
+    print("\nProcessing complete.")
+    print(f"Total: {summary['total']}, Successes: {summary['successes']}, "
+          f"Failures: {summary['failures']}, Time: {summary['elapsed_sec']}s")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
